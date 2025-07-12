@@ -1,0 +1,12 @@
+ragas
+langchain-openai
+openai
+spacy
+langchain-community
+langchain-text-splitters
+
+langchain-google-genai
+faiss-cpu
+sentence-transformers
+PyMuPDF
+numpy
