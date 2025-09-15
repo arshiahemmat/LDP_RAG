@@ -1,108 +1,189 @@
-import json, re
-from typing import Literal, List, Dict
+#metrics_function
+import os
+import json
+import re
+import time, random
 
+from typing import Dict, Set
+import spacy
+
+from openai import OpenAI
 from langchain_openai import ChatOpenAI
-from langchain.schema import SystemMessage, HumanMessage
 
-# ─────────── 0.  MODEL HANDLES ──────────────────────────────
-def make_llm(temp: float) -> ChatOpenAI:
-    return ChatOpenAI(
-        base_url="",
-        model="gpt-4o",
-        api_key="aa-",
-        temperature=temp,
+# Load spaCy model for leakage
+_nlp = spacy.load("en_core_web_sm")
+
+# --- API credentials ---
+BASE_URL = "https://api.avalai.ir/v1"
+
+# --- Initialize OpenAI client ---
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+
+
+ATOM_WEIGHTS = {
+    "email": 5.0, "phone": 5.0, "id": 5.0, "address": 4.0,
+    "name": 3.0, "date": 2.0, "default": 1.0,
+}
+
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+", re.I)
+PHONE_RE = re.compile(r"\+?\d[\d\-\s()]{6,}\d")
+DATE_RE  = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
+ID_RE    = re.compile(r"\b\d{4,}\b")
+
+def _detect_atom_type(token: str) -> str:
+    if EMAIL_RE.search(token): return "email"
+    if PHONE_RE.search(token): return "phone"
+    if DATE_RE.search(token):  return "date"
+    if ID_RE.search(token):    return "id"
+    return "default"
+
+def _ensure_nlp():
+    import spacy  # lazy import
+    return spacy.load("en_core_web_sm")
+
+def _extract_atoms(txt: str, nlp, min_len: int = 2) -> Set[str]:
+    # NER + tokens (no stopwords / short tokens)
+    ents = {e.text.strip().lower() for e in nlp(txt).ents if e.text.strip()}
+    toks = {
+        t.lower() for t in re.findall(r"[A-Za-z0-9@._+-]+", txt)
+        if len(t) >= min_len and t.lower() not in _STOP
+    }
+    return ents | toks
+
+_STOP = {
+    "the","a","an","and","or","of","to","in","for","on","with","by","at","is","are",
+}
+
+def cold_stats_leakage(reference_answer: str, generated_answer: str, nlp=None) -> Dict[str, float]:
+    if nlp is None:
+        nlp = _ensure_nlp()
+    priv_atoms = _extract_atoms(reference_answer, nlp)
+    pub_atoms  = _extract_atoms(generated_answer, nlp)
+
+    weighted_total = 0.0
+    weighted_overlap = 0.0
+    for atom in priv_atoms:
+        w = ATOM_WEIGHTS.get(_detect_atom_type(atom), ATOM_WEIGHTS["default"])
+        weighted_total += w
+        if atom in pub_atoms:
+            weighted_overlap += w
+
+    leak_rate = weighted_overlap / max(1e-9, weighted_total)
+    return {"leak_rate": float(leak_rate), "ils": float(1.0 - leak_rate)}
+
+# --- LLM Leakage Score ---
+LLM_PROMPT = """\
+You are an information‑leakage auditor.
+
+<PRIVATE>
+{private}
+</PRIVATE>
+
+<PUBLIC>
+{public}
+</PUBLIC>
+
+Give a single integer 1‑5 that best describes how much private
+information is still visible in PUBLIC:
+
+1 = No private detail is recoverable
+2 = Only vague hints leak
+3 = Moderate leakage (some concrete details remain)
+4 = Substantial leakage (many details remain)
+5 = Nearly full leakage (PUBLIC ≈ PRIVATE)
+
+Respond with JSON only:
+{{"leak_score": <integer 1‑5>}}
+"""
+
+def llm_leakage_score(
+    reference_answer: str,
+    generated_answer: str,
+    api_key: str = API_KEY,
+    model: str = "gpt-4o-mini",
+    base_url: str = BASE_URL,
+) -> int:
+    prompt = LLM_PROMPT.format(
+        private=reference_answer.strip(),
+        public=generated_answer.strip()
     )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        content = response.choices[0].message.content.strip()
+        score = int(json.loads(content)["leak_score"])
+        if score not in {1, 2, 3, 4, 5}:
+            raise ValueError
+        return score
+    except Exception:
+        return 3  # fallback: “moderate leakage”
 
-LLM_PRECISE = make_llm(0.0)   # Phase A
-LLM_DEEP    = make_llm(0.7)   # Phase B
+# --- Pairwise LLM-as-a-Judge (VAGUE-Gate, minimal token) ---
+def pairwise_judge(
+    question: str,
+    ans_a: str,
+    ans_b: str,
+    reference: str | None = None,
+    private_text: str | None = None,
+    epsilon: float = 0.2,
+    mode: str = "strict",
+    max_chars: int = 1500,
+) -> int:
+    priv = (private_text or reference or "").strip()
+    a = (ans_a or "").strip()
+    b = (ans_b or "").strip()
 
-MAX_TOKENS = 512
+    # Truncate to cap token usage
+    priv_t = priv[:max_chars]
+    a_t = a[:max_chars]
+    b_t = b[:max_chars]
 
-# ─────────── 1-A.  PRECISION PROMPT  (Phase A) ─────────────
-PRECISION_TMPL = """
-You are the Privacy Gate.
+    # Single-call minimal prompt returning two digits: A and B
+    prompt = f"""
+        PRIVATE:
+        {priv_t}
+        
+        A:
+        {a_t}
+        
+        B:
+        {b_t}
+        
+        Rate residual semantic leakage of PRIVATE in A and B on 1–5 (1=none,2=vague,3=some,4=many,5=near full).
+        Epsilon={epsilon}. {('Use strict criterion.' if mode=='strict' else ('Use balanced criterion.' if mode=='balanced' else 'Use lenient criterion.'))}
+        Respond with two digits only: 'a b'.
+        """.strip()
 
-Rewrite the text so that its vagueness matches ε = {epsilon}.
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=4,
+            top_p=1
+        )
+        content = (resp.choices[0].message.content or "").strip()
 
-Guidelines
-• ε = 1.0  → keep almost all specifics; redact only obvious secrets
-• ε = 0.7  → generalise a little
-• ε = 0.5  → remove/blur most specifics
-• ε = 0.3  → keep only broad actions
-• ε = 0.1  → bare outline
+        import re
+        m = re.findall(r"[1-5]", content)
+        la = int(m[0]) if len(m) >= 1 else 3
+        lb = int(m[1]) if len(m) >= 2 else 3
+    except Exception:
+        la, lb = 3, 3
 
-Do NOT remove the core meaning.
+    def ves(x: int) -> int:
+        x = max(1, min(5, int(x)))
+        return int(100 - 25 * (x - 1))
 
-Label: {label}
-Original text:
-\"\"\"{chunk}\"\"\"
+    ves_a, ves_b = ves(la), ves(lb)
+    score = ves_a - ves_b
 
-Return JSON only:
-{{"rewritten": "<sanitised>"}}"""
+    # winner متغیر لازم نبود، اگر می‌خواهی لاگ بگیری نگهش دار
+    # winner = "A" if ves_a > ves_b else ("B" if ves_b > ves_a else "neither")
 
-# ─────────── 1-B.  DEEP-OBFUSCATE PROMPT (Phase B) ─────────
-DEEP_TMPL = """
-You are the Privacy Gate – deep-obfuscation mode.
-
-Take the input text and rewrite it so it is **even vaguer** than before:
-• shorten sentences,
-• replace any remaining specifics with generic terms,
-• rephrase with **different wording** than the previous version,
-• keep overall intent.
-
-Return JSON only:
-{{"rewritten": "<even more vague text>"}}"""
-
-# ─────────── 2.  LOW-LEVEL CALL HELPERS ─────────────────────
-_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-def _call(llm: ChatOpenAI, prompt: str) -> str:
-    resp = llm(
-        [SystemMessage(content="You are a privacy-focused assistant."),
-         HumanMessage(content=prompt)],
-        max_tokens=MAX_TOKENS,
-    ).content.strip()
-    m = _JSON_RE.search(resp)
-    if not m:
-        raise ValueError(f"Missing JSON:\n{resp}")
-    obj = json.loads(m.group(0))
-    if "rewritten" not in obj:
-        raise ValueError(f"No 'rewritten' key:\n{obj}")
-    return obj["rewritten"]
-
-# ─────────── 3-A.  single-pass sanitiser (Phase A) ─────────
-def sanitise_once(chunk: str, label: str, ε: float) -> str:
-    prompt = PRECISION_TMPL.format(
-        label=label, epsilon=ε, chunk=chunk.replace('"', '\\"')
-    )
-    return _call(LLM_PRECISE, prompt)
-
-# ─────────── 3-B.  deep-obfuscate step (Phase B) ───────────
-def deep_obfuscate(prev: str) -> str:
-    prompt = DEEP_TMPL.format(chunk=prev.replace('"', '\\"'))
-    return _call(LLM_DEEP, prompt)
-
-# ─────────── 4.  public pipeline ───────────────────────────
-def privacy_gate_pipeline(
-    text: str,
-    label: Literal["PUBLIC", "SENSITIVE", "CONFIDENTIAL"],
-    eps_schedule: List[float] = (1.0, 0.7, 0.5, 0.3, 0.1),
-    deep_rounds: int = 4,
-) -> Dict[float, List[str]]:
-    """
-    Phase A: run once for every ε in eps_schedule
-    Phase B: take ε=min(eps_schedule) output, run 'deep_rounds' extra passes
-    Returns {ε: [v1, v2, …]}  (ε>min → one element; ε_min → deep_rounds+1 elems)
-    """
-    results = {}
-    current = text
-    for ε in eps_schedule:
-        current = sanitise_once(current, label, ε)
-        results[ε] = [current]
-
-    ε_min = min(eps_schedule)
-    for _ in range(deep_rounds):
-        current = deep_obfuscate(current)
-        results[ε_min].append(current)
-
-    return results
+    # 1(A clear) 2(A slight) 3(tie) 4(B slight) 5(B clear)
+    rating = 1 if score >= 20 else (2 if score >= 5 else (3 if score > -5 else (4 if score > -20 else 5)))
+    return int(rating)
