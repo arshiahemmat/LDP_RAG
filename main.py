@@ -21,6 +21,19 @@ from typing import Dict, List, Any
 
 import json5  
 
+
+# ---------------------------------------------------------------------------
+# 0.  Registry of available Models
+# ---------------------------------------------------------------------------
+
+model_aliases = {
+    'gemini': 'gemini-2.0-flash-lite',
+    'openai': '4o-mini',
+    'deepseek': 'deepseek-v3.1',
+    'qwen': 'qwen3-235b-a22b-instruct-2507'
+}
+
+
 # ---------------------------------------------------------------------------
 # 0.  Registry of available RAG classes 
 # ---------------------------------------------------------------------------
