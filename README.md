@@ -174,13 +174,3 @@ df = pd.read_json("runs/demo.jsonl", lines=True)
 | 401 / 403 from LLM           | Check `OPENAI_API_KEY` and `--base_url`             |
 | “No documents loaded yet”    | Ensure `.docx` files actually exist in `--docs_dir` |
 | Metric `KeyError`            | Verify the metric name passed in `--metrics`        |
-
----
-
-## 📜 License
-
-Add your license text here.
-
----
-
-> Made with ❤️ & LangChain.  Happy experimenting!
