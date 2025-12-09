@@ -74,7 +74,7 @@ pip install langchain faiss-cpu openai google-generativeai json5
 pip install pandas
 ```
 
-> **Python 3.9 or newer** is highly recommended (pre‑built FAISS wheels available).
+> **Python 3.11 or newer** is highly recommended (pre‑built FAISS wheels available).
 
 ---
 
