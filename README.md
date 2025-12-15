@@ -154,6 +154,7 @@ df = pd.read_json("runs/demo.jsonl", lines=True)
 
 ---
 
+
 ## 🔌 Extending the pipeline
 
 | Task                       | How                                                                                                                        |
@@ -165,6 +166,7 @@ df = pd.read_json("runs/demo.jsonl", lines=True)
 † Class must provide `.load_documents()`, `.save_vector_store()`, `.load_vector_store()`, and `.generate()`.
 
 ---
+
 
 ## 🐛 Troubleshooting
 
